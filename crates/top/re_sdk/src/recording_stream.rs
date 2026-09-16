@@ -9,9 +9,10 @@ use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
 use itertools::Either;
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
+use re_byte_size::SizeBytes as _;
 use re_chunk::{
     BatcherFlushError, BatcherHooks, Chunk, ChunkBatcher, ChunkBatcherConfig, ChunkBatcherError,
-    ChunkComponents, ChunkError, ChunkId, PendingRow, RowId, TimeColumn,
+    ChunkComponents, ChunkError, ChunkId, PendingRow, RowId, SplitRowsOptions, TimeColumn,
 };
 use re_log::env_var_flag;
 use re_log_msg::{
@@ -1594,6 +1595,11 @@ impl RecordingStream {
     }
 }
 
+/// gRPC/protobuf cannot carry a single message anywhere close to their nominal 2GiB limit in
+/// practice (h2 framing overhead, etc.), so chunks are split well below that. See
+/// <https://github.com/rerun-io/rerun/issues/11993>.
+const MAX_ARROW_MSG_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
 #[expect(clippy::needless_pass_by_value)]
 fn forwarding_thread(
     store_info: StoreInfo,
@@ -1696,15 +1702,30 @@ fn forwarding_thread(
         // NOTE: Always pop chunks first, this is what makes `Command::PopPendingChunks` possible,
         // which in turns makes `RecordingStream::flush_blocking` well defined.
         while let Ok(chunk) = chunks.try_recv() {
-            let mut msg = match chunk.to_arrow_msg() {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    re_log::error!(%err, "couldn't serialize chunk; data dropped (this is a bug in Rerun!)");
-                    continue;
-                }
+            let chunk = Arc::new(chunk);
+            let pieces = if chunk.total_size_bytes() > MAX_ARROW_MSG_BYTES {
+                Chunk::split_rows(
+                    chunk,
+                    &SplitRowsOptions {
+                        chunk_max_bytes: MAX_ARROW_MSG_BYTES,
+                        chunk_max_rows: u64::MAX,
+                        chunk_max_rows_if_unsorted: u64::MAX,
+                    },
+                )
+            } else {
+                vec![chunk]
             };
-            msg.on_release.clone_from(&on_release);
-            sink.send(LogMsg::ArrowMsg(store_info.store_id.clone(), msg));
+            for piece in pieces {
+                let mut msg = match piece.to_arrow_msg() {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        re_log::error!(%err, "couldn't serialize chunk; data dropped (this is a bug in Rerun!)");
+                        continue;
+                    }
+                };
+                msg.on_release.clone_from(&on_release);
+                sink.send(LogMsg::ArrowMsg(store_info.store_id.clone(), msg));
+            }
         }
 
         re_quota_channel::select! {
@@ -1716,15 +1737,29 @@ fn forwarding_thread(
                     break;
                 };
 
-                let msg = match chunk.to_arrow_msg() {
-                    Ok(chunk) => chunk,
-                    Err(err) => {
-                        re_log::error!(%err, "couldn't serialize chunk; data dropped (this is a bug in Rerun!)");
-                        continue;
-                    }
+                let chunk = Arc::new(chunk);
+                let pieces = if chunk.total_size_bytes() > MAX_ARROW_MSG_BYTES {
+                    Chunk::split_rows(
+                        chunk,
+                        &SplitRowsOptions {
+                            chunk_max_bytes: MAX_ARROW_MSG_BYTES,
+                            chunk_max_rows: u64::MAX,
+                            chunk_max_rows_if_unsorted: u64::MAX,
+                        },
+                    )
+                } else {
+                    vec![chunk]
                 };
-
-                sink.send(LogMsg::ArrowMsg(store_info.store_id.clone(), msg));
+                for piece in pieces {
+                    let msg = match piece.to_arrow_msg() {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            re_log::error!(%err, "couldn't serialize chunk; data dropped (this is a bug in Rerun!)");
+                            continue;
+                        }
+                    };
+                    sink.send(LogMsg::ArrowMsg(store_info.store_id.clone(), msg));
+                }
             }
 
             recv(cmds_rx) -> res => {
@@ -3568,5 +3603,97 @@ mod tests {
             new_config_recv_result,
             Err(crossbeam::channel::RecvTimeoutError::Timeout)
         );
+    }
+
+    /// Regression test for <https://github.com/rerun-io/rerun/issues/11993>: a `Chunk` that
+    /// exceeds the configured byte threshold must be split into multiple pieces (with all rows
+    /// preserved), using the exact `SplitRowsOptions` shape `forwarding_thread` applies before
+    /// handing a chunk to the sink — byte limit only, row limits left uncapped.
+    #[test]
+    fn oversized_chunk_is_split_before_transport() {
+        use re_log_types::example_components::MyPoint;
+
+        let entity_path = "oversized_chunk_is_split_before_transport";
+        let timeline = Timeline::new_sequence("frame");
+        let points = &[MyPoint::new(1.0, 2.0)];
+
+        let mut builder = Chunk::builder(entity_path);
+        const NUM_ROWS: i64 = 64;
+        for frame_nr in 0..NUM_ROWS {
+            builder = builder.with_component_batch(
+                RowId::new(),
+                [(timeline, frame_nr)],
+                (MyPoints::descriptor_points(), points),
+            );
+        }
+        let chunk = Arc::new(builder.build().unwrap());
+        let original_num_rows = chunk.num_rows();
+        assert_eq!(original_num_rows, NUM_ROWS as usize);
+
+        // A deliberately tiny threshold, well under this chunk's real size, so the split
+        // path is exercised without needing to synthesize gigabytes of data in a unit test.
+        let tiny_threshold = chunk.total_size_bytes() / 4;
+        let pieces = Chunk::split_rows(
+            chunk,
+            &SplitRowsOptions {
+                chunk_max_bytes: tiny_threshold,
+                chunk_max_rows: u64::MAX,
+                chunk_max_rows_if_unsorted: u64::MAX,
+            },
+        );
+
+        assert!(
+            pieces.len() > 1,
+            "expected the oversized chunk to be split into multiple pieces"
+        );
+        let total_rows: usize = pieces.iter().map(|piece| piece.num_rows()).sum();
+        assert_eq!(
+            total_rows, original_num_rows,
+            "splitting must not drop or duplicate rows"
+        );
+    }
+
+    /// Regression guard: ordinary, small log calls (the common case for every existing user)
+    /// must still produce exactly one `LogMsg::ArrowMsg`, i.e. the new size check in
+    /// `forwarding_thread` must not change behavior below the threshold.
+    #[test]
+    fn small_chunk_produces_single_arrow_msg() {
+        use re_log_types::example_components::MyPoint;
+        use re_sdk_types::ToArrow;
+
+        let (rec, storage) = RecordingStreamBuilder::new("rerun_example_small_chunk")
+            .enabled(true)
+            .batcher_config(ChunkBatcherConfig::NEVER)
+            .memory()
+            .unwrap();
+
+        let row = PendingRow {
+            row_id: RowId::new(),
+            timepoint: TimePoint::default(),
+            components: std::iter::once((
+                MyPoints::descriptor_points().component,
+                SerializedComponentBatch::new(
+                    <MyPoint as ToArrow>::to_arrow([MyPoint::new(1.0, 2.0)]).unwrap(),
+                    MyPoints::descriptor_points(),
+                ),
+            ))
+            .collect(),
+        };
+        rec.record_row("small".into(), row, false);
+        rec.flush_blocking().ok();
+
+        // The stream also auto-emits a separate `RecordingInfo` chunk on creation (see
+        // `RecordingStream`'s "pre-populate the batcher" comment above), so filter down to the
+        // entity we actually logged rather than asserting on the raw message count.
+        let arrow_msg_count = storage
+            .take()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                LogMsg::ArrowMsg(_, arrow_msg) => Chunk::from_arrow_msg(&arrow_msg).ok(),
+                _ => None,
+            })
+            .filter(|chunk| chunk.entity_path() == &EntityPath::from("small"))
+            .count();
+        assert_eq!(arrow_msg_count, 1);
     }
 }
