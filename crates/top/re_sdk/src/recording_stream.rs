@@ -1600,6 +1600,35 @@ impl RecordingStream {
 /// <https://github.com/rerun-io/rerun/issues/11993>.
 const MAX_ARROW_MSG_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
+/// Split `chunk` into pieces small enough to send as individual gRPC messages, if it's over
+/// [`MAX_ARROW_MSG_BYTES`].
+///
+/// Known gap: [`Chunk::split_rows`] is a documented no-op for a chunk with one row or fewer
+/// (there's nothing to split *between* rows), so a single oversized `log()` call — e.g. one very
+/// large point cloud or tensor logged without time-batching — is returned unsplit and can still
+/// hit the same gRPC failure this function otherwise avoids. No mechanism in this codebase can
+/// shrink a single component's single-row value (column-splitting only rearranges *siblings*; it
+/// never reduces the size of any one of them), so that case needs a different fix, likely slicing
+/// within an individual array value, which doesn't exist yet. See
+/// <https://github.com/rerun-io/rerun/issues/11993>.
+///
+/// `max_bytes` is a parameter (rather than reading [`MAX_ARROW_MSG_BYTES`] directly) so it can
+/// be exercised with a small threshold in tests, without needing gigabyte-scale data.
+fn split_oversized_chunk(chunk: Chunk, max_bytes: u64) -> Vec<Arc<Chunk>> {
+    let chunk = Arc::new(chunk);
+    if chunk.total_size_bytes() <= max_bytes {
+        return vec![chunk];
+    }
+    Chunk::split_rows(
+        chunk,
+        &SplitRowsOptions {
+            chunk_max_bytes: max_bytes,
+            chunk_max_rows: u64::MAX,
+            chunk_max_rows_if_unsorted: u64::MAX,
+        },
+    )
+}
+
 #[expect(clippy::needless_pass_by_value)]
 fn forwarding_thread(
     store_info: StoreInfo,
@@ -1702,20 +1731,7 @@ fn forwarding_thread(
         // NOTE: Always pop chunks first, this is what makes `Command::PopPendingChunks` possible,
         // which in turns makes `RecordingStream::flush_blocking` well defined.
         while let Ok(chunk) = chunks.try_recv() {
-            let chunk = Arc::new(chunk);
-            let pieces = if chunk.total_size_bytes() > MAX_ARROW_MSG_BYTES {
-                Chunk::split_rows(
-                    chunk,
-                    &SplitRowsOptions {
-                        chunk_max_bytes: MAX_ARROW_MSG_BYTES,
-                        chunk_max_rows: u64::MAX,
-                        chunk_max_rows_if_unsorted: u64::MAX,
-                    },
-                )
-            } else {
-                vec![chunk]
-            };
-            for piece in pieces {
+            for piece in split_oversized_chunk(chunk, MAX_ARROW_MSG_BYTES) {
                 let mut msg = match piece.to_arrow_msg() {
                     Ok(msg) => msg,
                     Err(err) => {
@@ -1737,20 +1753,7 @@ fn forwarding_thread(
                     break;
                 };
 
-                let chunk = Arc::new(chunk);
-                let pieces = if chunk.total_size_bytes() > MAX_ARROW_MSG_BYTES {
-                    Chunk::split_rows(
-                        chunk,
-                        &SplitRowsOptions {
-                            chunk_max_bytes: MAX_ARROW_MSG_BYTES,
-                            chunk_max_rows: u64::MAX,
-                            chunk_max_rows_if_unsorted: u64::MAX,
-                        },
-                    )
-                } else {
-                    vec![chunk]
-                };
-                for piece in pieces {
+                for piece in split_oversized_chunk(chunk, MAX_ARROW_MSG_BYTES) {
                     let msg = match piece.to_arrow_msg() {
                         Ok(msg) => msg,
                         Err(err) => {
@@ -3650,6 +3653,40 @@ mod tests {
         assert_eq!(
             total_rows, original_num_rows,
             "splitting must not drop or duplicate rows"
+        );
+    }
+
+    /// Pins a known, disclosed gap (see `split_oversized_chunk`'s doc comment): a single-row
+    /// chunk cannot be split by `Chunk::split_rows` (there's nothing to split *between* one
+    /// row), so it's returned unchanged even when it's over the threshold. This test exists so a
+    /// future attempt to fix this case changes a test deliberately, rather than the gap silently
+    /// staying undocumented in behavior even after the doc comment says otherwise.
+    #[test]
+    fn oversized_single_row_chunk_is_not_split() {
+        use re_log_types::example_components::MyPoint;
+        use re_sdk_types::ToArrow;
+
+        let entity_path = "oversized_single_row_chunk_is_not_split";
+        let chunk = Chunk::builder(entity_path)
+            .with_row(
+                RowId::new(),
+                TimePoint::default(),
+                [(
+                    MyPoints::descriptor_points(),
+                    <MyPoint as ToArrow>::to_arrow([MyPoint::new(1.0, 2.0)]).unwrap(),
+                )],
+            )
+            .build()
+            .unwrap();
+        assert_eq!(chunk.num_rows(), 1);
+
+        let tiny_threshold = chunk.total_size_bytes() / 4;
+        let pieces = split_oversized_chunk(chunk, tiny_threshold);
+
+        assert_eq!(
+            pieces.len(),
+            1,
+            "known gap: a single-row chunk cannot be split further today"
         );
     }
 
